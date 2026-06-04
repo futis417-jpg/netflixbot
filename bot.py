@@ -6,6 +6,7 @@ import time
 import threading
 import random
 import string
+import traceback
 from datetime import datetime, timedelta
 from flask import Flask
 from playwright.sync_api import sync_playwright
@@ -16,12 +17,16 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 SUPER_ADMIN_ID = 8398522835 
-ADMIN_USERNAME = "izi_1244" # TU USUARIO DE TELEGRAM PARA VENTAS
+ADMIN_USERNAME = "izi_1244"
+ADMIN_LINK = f"https://t.me/{ADMIN_USERNAME}"
+
 MAX_USES_PER_COOKIE = 3
 RATE_LIMIT_SECONDS = 60
 
+# Cache global para optimizar y seguridad
 user_last_action = {}
 db_lock = threading.Lock()
+bot_info = None
 
 def init_db():
     with db_lock:
@@ -41,20 +46,17 @@ def init_db():
         try:
             with open('database.json', 'r') as f:
                 db = json.load(f)
-                # Migraciones para asegurar que no se rompe nada viejo
                 for key in default_db:
                     if key not in db: db[key] = default_db[key]
-                
                 if SUPER_ADMIN_ID not in db['admins']: db['admins'].append(SUPER_ADMIN_ID)
                 
-                # Migración de perfiles para el nuevo sistema diario
                 for uid, profile in db['user_profiles'].items():
                     if 'plan' not in profile: profile['plan'] = 'free'
                     if 'vip_expiry' not in profile: profile['vip_expiry'] = None
                     if 'daily_activations' not in profile: profile['daily_activations'] = 0
                     if 'last_reset_date' not in profile: profile['last_reset_date'] = datetime.now().strftime("%Y-%m-%d")
-                    # Eliminamos el viejo 'activations_left' si existe para no confundir
-                    if 'activations_left' in profile: del profile['activations_left']
+                    if 'referrals' not in profile: profile['referrals'] = 0
+                    if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
                 return db
         except:
             return default_db
@@ -69,8 +71,18 @@ def is_admin(user_id):
     db = init_db()
     return user_id in db.get('admins', [])
 
+def auto_repair_system():
+    """Limpia archivos fantasma y libera RAM sin que el usuario se entere."""
+    try:
+        clean_old_screenshots()
+        # Limpiar diccionario de spam para evitar que crezca infinitamente
+        now = time.time()
+        for k in list(user_last_action.keys()):
+            if now - user_last_action[k] > 3600:
+                del user_last_action[k]
+    except: pass
+
 def check_and_reset_daily_limits(uid_str, db):
-    """Comprueba si ha cambiado de día y resetea los contadores diarios."""
     today = datetime.now().strftime("%Y-%m-%d")
     profile = db['user_profiles'].get(uid_str)
     
@@ -79,10 +91,10 @@ def check_and_reset_daily_limits(uid_str, db):
             profile['daily_activations'] = 0
             profile['last_reset_date'] = today
             save_db(db)
+    auto_repair_system()
     return profile
 
 def check_vip_status(user_id):
-    """Comprueba si el usuario es VIP y si su plan ha caducado."""
     db = init_db()
     uid_str = str(user_id)
     profile = db['user_profiles'].get(uid_str, {})
@@ -93,15 +105,21 @@ def check_vip_status(user_id):
             db['user_profiles'][uid_str]['plan'] = 'free'
             db['user_profiles'][uid_str]['vip_expiry'] = None
             save_db(db)
-            bot.send_message(user_id, f"⚠️ **Tu suscripción VIP ha caducado.** Has vuelto al plan Gratuito.\n\nContacta con @{ADMIN_USERNAME} para renovar.", parse_mode="Markdown")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔄 Renovar VIP Ahora", url=ADMIN_LINK))
+            bot.send_message(user_id, "⚠️ **Tu suscripción VIP ha caducado.** Has vuelto al plan Gratuito.\n\nPulsa abajo para renovar con el Administrador.", reply_markup=markup, parse_mode="Markdown")
             return False
         return True
     return False
 
-def track_user(message):
+def track_user(message, referred_by=None):
     db = init_db()
     user_id = str(message.from_user.id)
+    is_new = False
+    
     if user_id not in db['user_profiles']:
+        is_new = True
+        bonus = 1 if referred_by else 0 
         db['user_profiles'][user_id] = {
             'first_seen': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'username': message.from_user.username,
@@ -110,14 +128,42 @@ def track_user(message):
             'plan': 'free',
             'daily_activations': 0,
             'last_reset_date': datetime.now().strftime("%Y-%m-%d"),
-            'vip_expiry': None
+            'vip_expiry': None,
+            'referrals': 0,
+            'bonus_daily': bonus
         }
+        
+        if referred_by and referred_by in db['user_profiles'] and referred_by != user_id:
+            db['user_profiles'][referred_by]['referrals'] += 1
+            refs = db['user_profiles'][referred_by]['referrals']
+            
+            if refs % 2 == 0:
+                current_expiry = db['user_profiles'][referred_by].get('vip_expiry')
+                now = datetime.now()
+                
+                if db['user_profiles'][referred_by]['plan'] == 'vip' and current_expiry:
+                    new_expiry = datetime.strptime(current_expiry, "%Y-%m-%d %H:%M:%S") + timedelta(days=1)
+                else:
+                    new_expiry = now + timedelta(days=1)
+                    
+                db['user_profiles'][referred_by]['plan'] = 'vip'
+                db['user_profiles'][referred_by]['vip_expiry'] = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
+                db['user_profiles'][referred_by]['daily_activations'] = 0
+                
+                try:
+                    bot.send_message(int(referred_by), f"🎉 **¡ENHORABUENA!** 🎉\n\nHas invitado a tu referido número {refs}. ¡Acabas de ganar **1 DÍA VIP GRATIS** de forma automática! 💎", parse_mode="Markdown")
+                except: pass
+            else:
+                try:
+                    bot.send_message(int(referred_by), f"👤 **¡Nuevo invitado unido!** (Llevas {refs}).\n¡Solo te falta 1 más para ganar 1 Día VIP! 💎", parse_mode="Markdown")
+                except: pass
+                
         save_db(db)
     else:
-        # Actualizar username por si se lo cambia
         db['user_profiles'][user_id]['username'] = message.from_user.username
         db['user_profiles'][user_id]['first_name'] = message.from_user.first_name
         save_db(db)
+    return is_new
 
 def check_rate_limit(user_id):
     if is_admin(user_id) or check_vip_status(user_id): return True
@@ -139,7 +185,6 @@ def generate_coupon_code(days):
     return f"VIP-{code[:4]}-{code[4:]}"
 
 def parse_netscape_cookies(text):
-    """Convierte el formato texto plano de HackStoreX/CrxsMods a JSON nativo de Playwright."""
     cookies = []
     for line in text.split('\n'):
         line = line.strip()
@@ -155,7 +200,6 @@ def parse_netscape_cookies(text):
     return cookies
 
 def run_playwright_activation(code, cookie_data):
-    """Inicia el navegador oculto, inyecta la cookie y escribe el código TV."""
     screenshot_path = f"error_{int(time.time())}.png"
     browser = None
     try:
@@ -171,43 +215,36 @@ def run_playwright_activation(code, cookie_data):
             
             try:
                 page.goto('https://www.netflix.com/tv8', timeout=60000)
-                time.sleep(3)
+                page.wait_for_load_state("domcontentloaded")
+                time.sleep(2)
                 
                 if "login" in page.url.lower():
                     page.screenshot(path=screenshot_path)
-                    return False, "❌ La cookie ha caducado o es inválida.", screenshot_path
+                    return False, "❌ La cookie ha caducado o la cuenta cambió de contraseña.", screenshot_path
                 
-                # NUEVO SISTEMA PARA LAS 8 CASILLAS:
-                # Localizamos el contenedor y los inputs
                 input_locator = page.locator('input[type="text"], input[type="tel"], input[type="number"], input[data-uia="pin-number-input"]').first
-                
-                # Hacemos clic para enfocar
                 input_locator.click(timeout=15000)
-                
-                # Tecleamos como humanos. La web pasará a la siguiente casilla automáticamente.
-                page.keyboard.type(code, delay=150)
-                time.sleep(2)
+                page.keyboard.type(code, delay=100)
                 
                 button_locator = page.locator('button[type="button"], button[type="submit"], button[data-uia="action-submit"]').first
                 button_locator.click(timeout=10000)
                 
-                time.sleep(5)
+                time.sleep(4)
                 if page.locator('.ui-message-error, [data-uia="error-message-container"]').is_visible():
                     page.screenshot(path=screenshot_path)
                     error_text = page.locator('.ui-message-error, [data-uia="error-message-container"]').first.text_content()
                     return False, f"❌ Netflix rechazó el código: {error_text}", screenshot_path
                 
-                return True, "🎉 ¡**TV Activada con éxito**! 📺✨\n\nTu televisor ha sido enlazado correctamente. ¡Prepara las palomitas!", None
+                return True, "🎉 ¡**TV Activada con éxito**! 📺✨\n\nTu televisor ha sido enlazado correctamente.\n¡Disfruta del mejor contenido!", None
             except Exception as e:
                 page.screenshot(path=screenshot_path)
-                return False, f"❌ Error interactuando con la web. Detalles: {str(e)[:100]}", screenshot_path
+                return False, f"❌ Error de lectura en Netflix. Detalles: {str(e)[:80]}", screenshot_path
             finally:
                 if browser: browser.close()
     except Exception as e:
-        return False, f"❌ Error de servidor (Playwright crash). {str(e)[:100]}", None
+        return False, f"❌ Error crítico de servidor. {str(e)[:80]}", None
 
 def check_cookie_validity(cookie_data):
-    """Comprueba de forma REAL si la sesión sigue activa cargando el DOM de Netflix."""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -217,7 +254,8 @@ def check_cookie_validity(cookie_data):
             context.add_cookies(cookies)
             page = context.new_page()
             page.goto('https://www.netflix.com/browse', timeout=30000)
-            time.sleep(4)
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(3)
             is_valid = page.locator('.account-menu-item, [data-uia="header-profile-link"]').is_visible()
             if not is_valid and "login" not in page.url.lower(): is_valid = True
             browser.close()
@@ -226,7 +264,6 @@ def check_cookie_validity(cookie_data):
         return False
 
 def background_spy(chat_id, msg_id, cookie_data):
-    """Modo ninja: Entra a Netflix y saca una captura de pantalla."""
     screenshot_path = f"spy_{int(time.time())}.png"
     browser = None
     try:
@@ -238,11 +275,11 @@ def background_spy(chat_id, msg_id, cookie_data):
             context.add_cookies(cookies)
             page = context.new_page()
             page.goto('https://www.netflix.com/browse', timeout=40000)
-            time.sleep(6) 
+            time.sleep(5) 
             page.screenshot(path=screenshot_path)
             
             with open(screenshot_path, 'rb') as photo:
-                bot.send_photo(chat_id, photo, caption="📸 **Captura en Vivo (Modo Espía)**", parse_mode="Markdown")
+                bot.send_photo(chat_id, photo, caption="📸 **Captura en Vivo (Modo Espía)**\n_Viendo lo que ve el usuario..._", parse_mode="Markdown")
             bot.delete_message(chat_id, msg_id)
     except Exception as e:
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ Error en Modo Espía. Detalles: {str(e)[:100]}")
@@ -257,14 +294,14 @@ def background_spy(chat_id, msg_id, cookie_data):
 def background_check_cookies(chat_id):
     db = init_db()
     buenas = 0; malas = 0
-    report = "📋 **REPORTE DE DIAGNÓSTICO** 📋\n\n"
+    report = "📋 **REPORTE DE DIAGNÓSTICO INTELIGENTE** 📋\n\n"
     for i, c in enumerate(db['cookies_list']):
         if c['status'] == 'active':
             is_valid = check_cookie_validity(c['data'])
             if not is_valid:
                 db['cookies_list'][i]['status'] = 'exhausted'
                 malas += 1
-                report += f"❌ Cuenta #{i+1} ({c.get('country','N/A')}) ➔ `Caducada`\n"
+                report += f"❌ Cuenta #{i+1} ({c.get('country','N/A')}) ➔ `Sesión Caducada`\n"
             else:
                 buenas += 1
                 report += f"✅ Cuenta #{i+1} ({c.get('country','N/A')}) ➔ `Operativa`\n"
@@ -275,7 +312,8 @@ def background_check_cookies(chat_id):
 def main_user_keyboard(user_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(KeyboardButton("📺 Activar TV"), KeyboardButton("💎 Mi Suscripción"))
-    markup.add(KeyboardButton("🎟️ Canjear Cupón"), KeyboardButton("ℹ️ Ayuda"))
+    markup.add(KeyboardButton("🎟️ Canjear Cupón"), KeyboardButton("🎁 Invitar y Ganar"))
+    markup.add(KeyboardButton("ℹ️ Ayuda"))
     if is_admin(user_id):
         markup.add(KeyboardButton("👑 Panel Admin"))
     return markup
@@ -294,40 +332,21 @@ def countries_keyboard(is_vip):
         markup.add(InlineKeyboardButton("🎲 Aleatorio (El más rápido)", callback_data="tv_country_random"))
     else:
         markup.add(InlineKeyboardButton("🎲 Asignación Automática (Gratis)", callback_data="tv_country_random"))
-        markup.add(InlineKeyboardButton("🔒 Elegir País (Solo VIP)", callback_data="upgrade_vip_promo"))
+        if active_countries:
+            for country in active_countries:
+                markup.add(InlineKeyboardButton(f"🔒 {country}", callback_data="upgrade_vip_promo"))
     return markup
 
 def admin_panel_keyboard(db):
     markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("➕ Añadir Cookie", callback_data="admin_add_cookie"),
-        InlineKeyboardButton("📥 Importar Lote", callback_data="admin_bulk_import")
-    )
-    markup.add(
-        InlineKeyboardButton("🎟️ Crear Cupón VIP", callback_data="admin_create_coupon"),
-        InlineKeyboardButton("💎 Gestionar Planes", callback_data="admin_manage_plans")
-    )
-    markup.add(
-        InlineKeyboardButton("💳 Gestionar Usuarios", callback_data="admin_manage_users"),
-        InlineKeyboardButton("📊 Estado Cuentas", callback_data="admin_status")
-    )
-    markup.add(
-        InlineKeyboardButton("📸 Modo Espía", callback_data="admin_spy_menu"),
-        InlineKeyboardButton("🔍 Diagnóstico Pro", callback_data="admin_check")
-    )
-    markup.add(
-        InlineKeyboardButton("👥 Admins", callback_data="admin_manage_admins"),
-        InlineKeyboardButton("📢 Mensaje Masivo", callback_data="admin_broadcast")
-    )
-    markup.add(
-        InlineKeyboardButton("🛡️ Panel Baneos", callback_data="admin_bans"),
-        InlineKeyboardButton("📄 Exportar BD", callback_data="admin_backup")
-    )
-    markup.add(
-        InlineKeyboardButton("📄 Exportar Usuarios", callback_data="admin_export_users"),
-        InlineKeyboardButton("🧹 Limpiar Agotadas", callback_data="admin_clear_dead_cookies")
-    )
-    markup.add(InlineKeyboardButton("⚙️ Forzar Limpieza", callback_data="admin_clear_cache"))
+    markup.add(InlineKeyboardButton("➕ Añadir Cookie", callback_data="admin_add_cookie"), InlineKeyboardButton("📥 Importar Lote", callback_data="admin_bulk_import"))
+    markup.add(InlineKeyboardButton("🎟️ Crear Cupón VIP", callback_data="admin_create_coupon"), InlineKeyboardButton("💎 Gestionar Planes", callback_data="admin_manage_plans"))
+    markup.add(InlineKeyboardButton("💳 Gestionar Usuarios", callback_data="admin_manage_users"), InlineKeyboardButton("📊 Estado Cuentas", callback_data="admin_status"))
+    markup.add(InlineKeyboardButton("📸 Modo Espía", callback_data="admin_spy_menu"), InlineKeyboardButton("🔍 Diagnóstico Pro", callback_data="admin_check"))
+    markup.add(InlineKeyboardButton("👥 Admins", callback_data="admin_manage_admins"), InlineKeyboardButton("🏆 Top Referidos", callback_data="admin_top_refs"))
+    markup.add(InlineKeyboardButton("📢 Mensaje Masivo", callback_data="admin_broadcast"), InlineKeyboardButton("🛡️ Panel Baneos", callback_data="admin_bans"))
+    markup.add(InlineKeyboardButton("📄 Exportar BD", callback_data="admin_backup"), InlineKeyboardButton("📄 Exportar Usuarios", callback_data="admin_export_users"))
+    markup.add(InlineKeyboardButton("🧹 Limpiar Agotadas", callback_data="admin_clear_dead_cookies"), InlineKeyboardButton("⚙️ Forzar Limpieza", callback_data="admin_clear_cache"))
     maint_text = "🔴 Quitar Mantenimiento" if db.get('maintenance_mode', False) else "🟢 Poner Mantenimiento"
     markup.add(InlineKeyboardButton(maint_text, callback_data="admin_toggle_maint"))
     return markup
@@ -343,7 +362,14 @@ def admin_plans_keyboard(db):
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    track_user(message)
+    global bot_info
+    if not bot_info: bot_info = bot.get_me()
+    
+    args = message.text.split()
+    referred_by = None
+    if len(args) > 1 and args[1].isdigit(): referred_by = args[1]
+        
+    is_new = track_user(message, referred_by)
     user_id = message.from_user.id
     db = init_db()
     check_and_reset_daily_limits(str(user_id), db)
@@ -353,14 +379,27 @@ def send_welcome(message):
         bot.send_message(message.chat.id, "🛠️ *MODO MANTENIMIENTO*\nEstamos realizando mejoras. Vuelve más tarde.", parse_mode="Markdown")
         return
 
+    profile = db['user_profiles'][str(user_id)]
+    base_lim = db['plans']['free']['daily_limit']
+    total_lim = base_lim + profile.get('bonus_daily', 0)
+
     texto = (
         "🎬 *¡Bienvenido al Centro de Activación Netflix TV!* 🎬\n\n"
         "Activa tu televisor en segundos sin necesidad de correos ni contraseñas.\n\n"
-        f"🎁 *Nivel Actual:* Tienes **{db['plans']['free']['daily_limit']} Activación Diaria Gratuita**.\n\n"
-        f"💎 *¿Quieres accesos ilimitados y elegir país?* Contacta a @{ADMIN_USERNAME}\n\n"
-        "Pulsa **📺 Activar TV** para empezar."
+        f"🎁 *Tu Plan Actual:* Tienes **{total_lim} Activaciones Diarias Gratuitas**.\n\n"
+        "💎 *¿Quieres accesos ilimitados, cero esperas y elegir tu país favorito?*\n"
+        "Pulsa el botón de abajo para conseguir tu **Pase VIP**.\n\n"
+        "👇 *Pulsa 📺 Activar TV en el menú para empezar.*"
     )
-    bot.send_message(message.chat.id, texto, reply_markup=main_user_keyboard(user_id), parse_mode="Markdown")
+    if is_new and referred_by:
+        texto = "🎉 *¡Bienvenido gracias a la invitación de un amigo!* 🎉\nHas recibido +1 Activación Diaria adicional como regalo.\n\n" + texto
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💬 Comprar VIP (Contactar Admin)", url=ADMIN_LINK))
+    
+    bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
+    # Mandamos el teclado normal también
+    bot.send_message(message.chat.id, "Selecciona una opción del menú de abajo:", reply_markup=main_user_keyboard(user_id))
 
 @bot.message_handler(func=lambda m: m.text == "💎 Mi Suscripción")
 def show_subscription(message):
@@ -368,34 +407,52 @@ def show_subscription(message):
     db = init_db()
     uid = str(message.from_user.id)
     profile = check_and_reset_daily_limits(uid, db)
-    db = init_db() # Refrescar
-    
     is_vip = check_vip_status(message.from_user.id)
+    db = init_db() 
     
+    markup = InlineKeyboardMarkup()
     if is_vip:
         plan_info = db['plans']['vip']
-        texto = f"👑 **PERFIL VIP ACTIVO** 👑\n\n"
-        texto += f"🔹 **Estado:** Privilegiado\n"
-        texto += f"🔹 **Válido hasta:** `{profile['vip_expiry']}`\n"
-        texto += f"🔹 **Límite Diario:** {plan_info['daily_limit']} TVs/día\n"
-        texto += f"🔹 **Hoy has usado:** {profile['daily_activations']}\n\n"
-        texto += "✨ *Gracias por apoyar nuestro servicio.*"
+        texto = f"👑 **PERFIL VIP ACTIVO** 👑\n\n🔹 **Estado:** Privilegiado\n🔹 **Válido hasta:** `{profile['vip_expiry']}`\n🔹 **Límite Diario:** {plan_info['daily_limit']} TVs/día\n🔹 **Hoy has usado:** {profile['daily_activations']}\n\n✨ *Gracias por apoyar nuestro servicio.*"
+        markup.add(InlineKeyboardButton("💬 Hablar con el Soporte", url=ADMIN_LINK))
     else:
         plan_info = db['plans']['free']
-        restantes = plan_info['daily_limit'] - profile['daily_activations']
+        limite_total = plan_info['daily_limit'] + profile.get('bonus_daily', 0)
+        restantes = limite_total - profile['daily_activations']
         if restantes < 0: restantes = 0
-        texto = f"👤 **PERFIL ESTÁNDAR (Gratis)** 👤\n\n"
-        texto += f"🔹 **Activaciones hoy:** `{profile['daily_activations']}/{plan_info['daily_limit']}`\n"
-        texto += f"🔹 **Disponibles ahora:** `{restantes}`\n"
-        texto += f"🔹 **Renovación de usos:** Medianoche (00:00)\n\n"
-        texto += f"🛒 *¿Quieres saltarte el límite y elegir país?* \n👉 **Contacta con @{ADMIN_USERNAME} para adquirir tu Pase VIP.**"
+        texto = f"👤 **PERFIL ESTÁNDAR (Gratis)** 👤\n\n🔹 **Activaciones hoy:** `{profile['daily_activations']}/{limite_total}`\n🔹 **Disponibles ahora:** `{restantes}`\n🔹 **Renovación de usos:** Medianoche (00:00)\n\n🛒 *¿Quieres saltarte el límite y elegir país?*\n"
+        markup.add(InlineKeyboardButton("💎 Comprar Pase VIP", url=ADMIN_LINK))
         
+    bot.reply_to(message, texto, reply_markup=markup, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "🎁 Invitar y Ganar")
+def show_referral_menu(message):
+    track_user(message)
+    global bot_info
+    if not bot_info: bot_info = bot.get_me()
+    
+    uid = str(message.from_user.id)
+    db = init_db()
+    refs = db['user_profiles'][uid].get('referrals', 0)
+    bot_link = f"https://t.me/{bot_info.username}?start={uid}"
+    
+    texto = (
+        "🎁 **SISTEMA DE REFERIDOS VIRAL** 🎁\n\n"
+        "¿No tienes dinero para el VIP? ¡Gánalo invitando a tus amigos!\n\n"
+        f"👥 **Tus invitados actuales:** `{refs}`\n\n"
+        "🏅 **TUS PREMIOS:**\n"
+        "• Cada **2 amigos** que invites = **1 Día de VIP ILIMITADO** automático.\n"
+        "• Tus amigos ganarán **2 usos diarios** (en vez de 1).\n\n"
+        "🔗 **TU ENLACE ÚNICO:**\n"
+        f"`{bot_link}`\n\n"
+        "_Copia este enlace y envíalo por WhatsApp o grupos._"
+    )
     bot.reply_to(message, texto, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "🎟️ Canjear Cupón")
 def ask_coupon(message):
     track_user(message)
-    msg = bot.reply_to(message, "🎟️ **Introduce tu código de cupón:**\n_(Ejemplo: VIP-A1B2-C3D4)_", parse_mode="Markdown")
+    msg = bot.reply_to(message, "🎟️ **Introduce tu código de cupón VIP:**\n_(Ejemplo: VIP-A1B2-C3D4)_", parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_coupon)
 
 def process_coupon(message):
@@ -417,23 +474,31 @@ def process_coupon(message):
             
         db['user_profiles'][user_id]['plan'] = 'vip'
         db['user_profiles'][user_id]['vip_expiry'] = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
-        db['user_profiles'][user_id]['daily_activations'] = 0 # Le reseteamos hoy por ser majo
+        db['user_profiles'][user_id]['daily_activations'] = 0 
         
         del db['coupons'][code]
         save_db(db)
-        
         bot.reply_to(message, f"🎉 **¡CUPÓN CANJEADO CON ÉXITO!** 🎉\n\nAcabas de activar `{days} días` de suscripción VIP. ¡Disfruta de ventajas exclusivas!", parse_mode="Markdown")
-        
-        for admin in db.get('admins', []):
-            try: bot.send_message(admin, f"💰 Cupón `{code}` ({days}d) usado por @{message.from_user.username}.")
-            except: pass
     else:
-        bot.reply_to(message, f"❌ **Cupón inválido o ya usado.**\n\nSi quieres comprar uno, escribe a @{ADMIN_USERNAME}.", parse_mode="Markdown")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💬 Comprar un Cupón", url=ADMIN_LINK))
+        bot.reply_to(message, "❌ **Cupón inválido o ya usado.**\n\nSi quieres adquirir un Pase VIP, contacta al administrador.", reply_markup=markup, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Ayuda")
 def help_menu(message):
-    texto = "*¿Cómo activar tu TV?* 📺\n1️⃣ Abre Netflix en tu TV.\n2️⃣ Selecciona 'Iniciar sesión por la Web'.\n3️⃣ Copia el código de 8 dígitos.\n4️⃣ Pulsa '📺 Activar TV' y envía el código.\n\n*¿Límite alcanzado?*\nHabla con @{ADMIN_USERNAME} para comprar acceso VIP ilimitado.".format(ADMIN_USERNAME=ADMIN_USERNAME)
-    bot.reply_to(message, texto, parse_mode="Markdown")
+    texto = (
+        "📖 **MANUAL DE USO - KANT FLIX** 📖\n\n"
+        "1️⃣ Abre Netflix en tu Televisor.\n"
+        "2️⃣ Selecciona la opción *'Iniciar sesión por la Web'*.\n"
+        "3️⃣ Te aparecerá un código de 8 dígitos en la pantalla.\n"
+        "4️⃣ Ven a este bot, pulsa *'📺 Activar TV'*.\n"
+        "5️⃣ Elige tu país y envía el código de 8 dígitos.\n\n"
+        "⚠️ _¿Te sale error de 'Límite Diario' o quieres elegir un país específico?_\n\n"
+        "💎 **Hazte VIP hoy mismo.** Sin límites de activaciones y con acceso total."
+    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💬 Comprar VIP (Contacto Directo)", url=ADMIN_LINK))
+    bot.reply_to(message, texto, reply_markup=markup, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "📺 Activar TV")
 def activate_tv_start(message):
@@ -449,41 +514,45 @@ def activate_tv_start(message):
         
     is_vip = check_vip_status(user_id)
     profile = check_and_reset_daily_limits(uid_str, db)
-    db = init_db() # Recargar
+    db = init_db() 
     
-    # Evaluar Plan y Límites
     current_plan_name = 'vip' if is_vip else 'free'
     plan_info = db['plans'][current_plan_name]
+    limite_diario = plan_info['daily_limit'] + (profile.get('bonus_daily', 0) if not is_vip else 0)
     
-    if not is_admin(user_id) and profile['daily_activations'] >= plan_info['daily_limit']:
+    if not is_admin(user_id) and profile['daily_activations'] >= limite_diario:
         texto_limite = (
-            f"❌ **Límite diario alcanzado.**\n\n"
-            f"Tu plan actual ({plan_info['name']}) solo permite **{plan_info['daily_limit']} activaciones al día**.\n\n"
-            f"💎 **¡No te quedes a medias!**\nAdquiere el Pase VIP para activaciones ilimitadas y elección de país.\n\n"
-            f"👉 **Contacta con @{ADMIN_USERNAME} para comprarlo al instante.**"
+            f"❌ **LÍMITE DIARIO ALCANZADO** ❌\n\n"
+            f"Tu plan actual permite **{limite_diario} activaciones al día**.\n\n"
+            f"💎 **¡Rompe el límite!**\nAdquiere el Pase VIP para activaciones ilimitadas y elección de país."
         )
-        bot.reply_to(message, texto_limite, parse_mode="Markdown")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛒 COMPRAR VIP AHORA", url=ADMIN_LINK))
+        bot.reply_to(message, texto_limite, reply_markup=markup, parse_mode="Markdown")
         return
 
     if not check_rate_limit(user_id):
-        bot.reply_to(message, f"⏳ Por favor, espera {RATE_LIMIT_SECONDS} segundos entre intentos (Seguridad Anti-Spam).")
+        bot.reply_to(message, f"⏳ Por favor, espera {RATE_LIMIT_SECONDS} segundos entre intentos (Sistema Anti-Spam).")
         return
 
     active_cookies = [c for c in db['cookies_list'] if c['status'] == 'active']
     if not active_cookies:
-        bot.reply_to(message, f"❌ No hay cuentas disponibles ahora mismo. Avisa a @{ADMIN_USERNAME}.", parse_mode="Markdown")
+        bot.reply_to(message, "❌ No hay cuentas disponibles ahora mismo. Avisa al Administrador.")
         return
 
-    bot.send_message(message.chat.id, "🌍 *Selecciona la asignación de cuenta:*", reply_markup=countries_keyboard(is_vip), parse_mode="Markdown")
+    bot.send_message(message.chat.id, "🌍 *Selecciona la región para tu TV:*", reply_markup=countries_keyboard(is_vip), parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "upgrade_vip_promo")
 def promo_vip(call):
-    bot.answer_callback_query(call.id, f"💎 Función exclusiva VIP. ¡Habla con @{ADMIN_USERNAME}!", show_alert=True)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("💎 Comprar VIP", url=ADMIN_LINK))
+    bot.send_message(call.message.chat.id, "🔒 **FUNCIÓN EXCLUSIVA VIP**\n\nLos usuarios gratuitos solo pueden usar la asignación automática. Para elegir este país a la carta, adquiere el Pase VIP pulsando abajo.", reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("tv_country_"))
 def ask_for_tv_code(call):
     country = call.data.replace("tv_country_", "")
-    msg = bot.send_message(call.message.chat.id, f"Selección: **{country.capitalize()}**.\n\n📺 Envíame el **código de 8 dígitos** que aparece en tu pantalla:", parse_mode="Markdown")
+    msg = bot.send_message(call.message.chat.id, f"Has elegido: **{country.capitalize()}**.\n\n📺 Envíame el **código de 8 dígitos** que aparece en la pantalla de tu TV:", parse_mode="Markdown")
     bot.register_next_step_handler(msg, lambda m: process_tv_code(m, country))
 
 def process_tv_code(message, country):
@@ -492,7 +561,7 @@ def process_tv_code(message, country):
     uid_str = str(user_id)
     
     if len(tv_code) != 8:
-        bot.reply_to(message, "❌ Error: El código debe tener exactamente 8 números o letras.")
+        bot.reply_to(message, "❌ Error: El código debe tener exactamente 8 caracteres.")
         return
 
     wait_msg = bot.send_message(message.chat.id, "🔄 *Conectando a los servidores y enlazando tu TV...*", parse_mode="Markdown")
@@ -508,7 +577,7 @@ def process_tv_code(message, country):
             break
             
     if not available_cookie:
-        bot.edit_message_text(chat_id=message.chat.id, message_id=wait_msg.message_id, text="❌ Vaya, la última cuenta de esa región se acaba de usar. Por favor, prueba otra vez.")
+        bot.edit_message_text(chat_id=message.chat.id, message_id=wait_msg.message_id, text="❌ Vaya, la última cuenta de esa región se acaba de usar. Por favor, prueba la asignación Aleatoria.")
         return
         
     success, result_msg, screenshot_path = run_playwright_activation(tv_code, available_cookie['data'])
@@ -520,7 +589,6 @@ def process_tv_code(message, country):
             db['cookies_list'][cookie_index]['status'] = 'exhausted'
         db['stats']['total_activations'] += 1
         
-        # Descontar del límite diario solo si no es admin
         if not is_admin(user_id):
             db['user_profiles'][uid_str]['daily_activations'] += 1
             
@@ -529,20 +597,14 @@ def process_tv_code(message, country):
         
         bot.delete_message(chat_id=message.chat.id, message_id=wait_msg.message_id)
         bot.send_message(message.chat.id, result_msg, parse_mode="Markdown")
-        
-        # Notificar a los admins silenciosamente
-        for admin in db.get('admins', []):
-            try: bot.send_message(admin, f"✅ Activo: `{tv_code}` por @{message.from_user.username}.\nUsos cookie #{cookie_index+1}: {db['cookies_list'][cookie_index]['uses']}/{MAX_USES_PER_COOKIE}")
-            except: pass
     else:
         db['stats']['failed_attempts'] += 1
-        # Si la cookie expiró, la matamos automáticamente para que el próximo usuario no sufra
         if "caducado" in result_msg.lower():
             db['cookies_list'][cookie_index]['status'] = 'exhausted'
             
         save_db(db)
         bot.delete_message(chat_id=message.chat.id, message_id=wait_msg.message_id)
-        bot.reply_to(message, "❌ Fallo al activar tu TV. El error ha sido enviado a los administradores para su revisión.")
+        bot.reply_to(message, "❌ Fallo al activar tu TV. El error ha sido enviado a los administradores.")
         
         admin_error = f"⚠️ Fallo en código `{tv_code}` de @{message.from_user.username}.\nMotivo: {result_msg}"
         for admin in db.get('admins', []):
@@ -553,7 +615,9 @@ def process_tv_code(message, country):
                 else: bot.send_message(admin, admin_error)
             except: pass
             
-        if screenshot_path and os.path.exists(screenshot_path): os.remove(screenshot_path)
+        if screenshot_path and os.path.exists(screenshot_path): 
+            try: os.remove(screenshot_path)
+            except: pass
 
 @bot.message_handler(commands=['admin'])
 @bot.message_handler(func=lambda m: m.text == "👑 Panel Admin")
@@ -567,107 +631,118 @@ def admin_callbacks(call):
     if not is_admin(call.from_user.id): return
     db = init_db()
     
-    if call.data == "admin_create_coupon":
-        msg = bot.send_message(call.message.chat.id, "🎟️ ¿Cuántos **DÍAS VIP** otorgará este cupón? (Ej: 30)")
-        bot.register_next_step_handler(msg, process_create_coupon)
-        
-    elif call.data == "admin_manage_plans":
-        texto = "💎 **Gestor de Planes y Límites**\n\n"
-        texto += f"🆓 **Plan Gratis:** {db['plans']['free']['daily_limit']} usos/día\n"
-        texto += f"👑 **Plan VIP:** {db['plans']['vip']['daily_limit']} usos/día\n\n"
-        texto += "Selecciona qué límite quieres modificar:"
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=texto, reply_markup=admin_plans_keyboard(db), parse_mode="Markdown")
-        
-    elif call.data == "admin_edit_plan_free":
-        msg = bot.send_message(call.message.chat.id, "✏️ Envía el **NUEVO NÚMERO** de activaciones diarias para el plan GRATIS:")
-        bot.register_next_step_handler(msg, lambda m: _edit_plan_limit(m, 'free'))
-        
-    elif call.data == "admin_edit_plan_vip":
-        msg = bot.send_message(call.message.chat.id, "✏️ Envía el **NUEVO NÚMERO** de activaciones diarias para el plan VIP:")
-        bot.register_next_step_handler(msg, lambda m: _edit_plan_limit(m, 'vip'))
-        
-    elif call.data == "admin_back_panel":
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="👑 **CENTRO DE MANDOS KANT FLIX** 👑", reply_markup=admin_panel_keyboard(db), parse_mode="Markdown")
+    try:
+        if call.data == "admin_create_coupon":
+            msg = bot.send_message(call.message.chat.id, "🎟️ ¿Cuántos **DÍAS VIP** otorgará este cupón? (Ej: 30)")
+            bot.register_next_step_handler(msg, process_create_coupon)
+            
+        elif call.data == "admin_manage_plans":
+            texto = f"💎 **Gestor de Planes**\n\n🆓 **Gratis:** {db['plans']['free']['daily_limit']}/día\n👑 **VIP:** {db['plans']['vip']['daily_limit']}/día\n\nSelecciona:"
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=texto, reply_markup=admin_plans_keyboard(db), parse_mode="Markdown")
+            
+        elif call.data == "admin_edit_plan_free":
+            msg = bot.send_message(call.message.chat.id, "✏️ Envía el **NUEVO NÚMERO** de usos al día para GRATIS:")
+            bot.register_next_step_handler(msg, lambda m: _edit_plan_limit(m, 'free'))
+            
+        elif call.data == "admin_edit_plan_vip":
+            msg = bot.send_message(call.message.chat.id, "✏️ Envía el **NUEVO NÚMERO** de usos al día para VIP:")
+            bot.register_next_step_handler(msg, lambda m: _edit_plan_limit(m, 'vip'))
+            
+        elif call.data == "admin_back_panel":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="👑 **CENTRO DE MANDOS KANT FLIX** 👑", reply_markup=admin_panel_keyboard(db), parse_mode="Markdown")
 
-    elif call.data == "admin_manage_users":
-        msg = bot.send_message(call.message.chat.id, "💳 Envía la **ID del usuario** para gestionarlo:")
-        bot.register_next_step_handler(msg, process_manage_user)
+        elif call.data == "admin_manage_users":
+            msg = bot.send_message(call.message.chat.id, "💳 Envía la **ID del usuario** para gestionarlo:")
+            bot.register_next_step_handler(msg, process_manage_user)
 
-    elif call.data == "admin_status":
-        activas = sum(1 for c in db['cookies_list'] if c['status'] == 'active')
-        texto = f"📊 **Cuentas Activas:** {activas}\n\n"
-        for i, c in enumerate(db['cookies_list']):
-            if c['status'] == 'active':
-                texto += f"#{i+1} ({c.get('country','N/A')}) - Usos: {c['uses']}/{MAX_USES_PER_COOKIE}\n"
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=texto, reply_markup=admin_panel_keyboard(db))
-        
-    elif call.data == "admin_spy_menu":
-        markup = InlineKeyboardMarkup()
-        for i, c in enumerate(db['cookies_list']):
-            if c['status'] == 'active':
-                markup.add(InlineKeyboardButton(f"📸 Cuenta #{i+1} ({c.get('country')})", callback_data=f"spy_{i}"))
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="📸 **MODO ESPÍA (Selecciona cuenta a capturar)**", reply_markup=markup, parse_mode="Markdown")
+        elif call.data == "admin_status":
+            activas = sum(1 for c in db['cookies_list'] if c['status'] == 'active')
+            texto = f"📊 **Cuentas Activas:** {activas}\n\n"
+            for i, c in enumerate(db['cookies_list']):
+                if c['status'] == 'active':
+                    texto += f"#{i+1} ({c.get('country','N/A')}) - Usos: {c['uses']}/{MAX_USES_PER_COOKIE}\n"
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=texto, reply_markup=admin_panel_keyboard(db))
+            
+        elif call.data == "admin_spy_menu":
+            markup = InlineKeyboardMarkup()
+            for i, c in enumerate(db['cookies_list']):
+                if c['status'] == 'active':
+                    markup.add(InlineKeyboardButton(f"📸 Cuenta #{i+1} ({c.get('country')})", callback_data=f"spy_{i}"))
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="📸 **MODO ESPÍA (Selecciona cuenta a capturar)**", reply_markup=markup, parse_mode="Markdown")
 
-    elif call.data == "admin_add_cookie":
-        msg = bot.send_message(call.message.chat.id, "🌍 ¿De qué país es la cuenta? (Ej: España, USA):")
-        bot.register_next_step_handler(msg, process_add_cookie_country)
+        elif call.data == "admin_add_cookie":
+            msg = bot.send_message(call.message.chat.id, "🌍 ¿De qué país es la cuenta? (Ej: España, USA):")
+            bot.register_next_step_handler(msg, process_add_cookie_country)
 
-    elif call.data == "admin_bulk_import":
-        msg = bot.send_message(call.message.chat.id, "📥 ¿De qué país es el LOTE entero?:")
-        bot.register_next_step_handler(msg, process_bulk_country)
+        elif call.data == "admin_bulk_import":
+            msg = bot.send_message(call.message.chat.id, "📥 ¿De qué país es el LOTE entero?:")
+            bot.register_next_step_handler(msg, process_bulk_country)
 
-    elif call.data == "admin_check":
-        bot.answer_callback_query(call.id, "🔍 Iniciando diagnóstico de cookies (tardará unos minutos)...")
-        threading.Thread(target=background_check_cookies, args=(call.message.chat.id,)).start()
+        elif call.data == "admin_check":
+            bot.answer_callback_query(call.id, "🔍 Iniciando diagnóstico... Recibirás el reporte por aquí.")
+            threading.Thread(target=background_check_cookies, args=(call.message.chat.id,)).start()
 
-    elif call.data == "admin_manage_admins":
-        if call.fromuser.id != SUPER_ADMIN_ID: return
-        markup = InlineKeyboardMarkup()
-        for admin_id in db['admins']:
-            markup.add(InlineKeyboardButton(f"ID: {admin_id}", callback_data="noop"), InlineKeyboardButton("❌ Quitar", callback_data=f"del_admin_{admin_id}"))
-        markup.add(InlineKeyboardButton("➕ Añadir Nuevo Admin", callback_data="add_new_admin"))
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="👥 **Gestión de Administradores**", reply_markup=markup, parse_mode="Markdown")
-        
-    elif call.data == "admin_broadcast":
-        msg = bot.send_message(call.message.chat.id, "📢 Envía el mensaje que le llegará a TODOS los usuarios:")
-        bot.register_next_step_handler(msg, process_broadcast)
-        
-    elif call.data == "admin_backup":
-        if os.path.exists('database.json'):
-            with open('database.json', 'rb') as doc:
-                bot.send_document(call.message.chat.id, doc, caption="💾 Backup BD Actual")
-                
-    elif call.data == "admin_export_users":
-        with open('users_export.txt', 'w', encoding='utf-8') as f:
-            f.write("ID | Username | Nombre | Plan | Fecha Ingreso\n")
-            f.write("-" * 60 + "\n")
-            for uid, p in db['user_profiles'].items():
-                f.write(f"{uid} | @{p.get('username','N/A')} | {p.get('first_name','N/A')} | {p.get('plan')} | {p.get('first_seen')}\n")
-        with open('users_export.txt', 'rb') as doc:
-            bot.send_document(call.message.chat.id, doc, caption="📄 Lista de Usuarios")
-        os.remove('users_export.txt')
-                
-    elif call.data == "admin_bans":
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔨 Banear ID", callback_data="ban_user"), InlineKeyboardButton("🕊️ Desbanear ID", callback_data="unban_user"))
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="🛡️ **Panel de Bloqueos**", reply_markup=markup, parse_mode="Markdown")
+        elif call.data == "admin_manage_admins":
+            if call.from_user.id != SUPER_ADMIN_ID: return
+            markup = InlineKeyboardMarkup()
+            for admin_id in db['admins']:
+                markup.add(InlineKeyboardButton(f"ID: {admin_id}", callback_data="noop"), InlineKeyboardButton("❌ Quitar", callback_data=f"del_admin_{admin_id}"))
+            markup.add(InlineKeyboardButton("➕ Añadir Nuevo Admin", callback_data="add_new_admin"))
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="👥 **Gestión de Administradores**", reply_markup=markup, parse_mode="Markdown")
+            
+        elif call.data == "admin_top_refs":
+            profiles = db.get('user_profiles', {})
+            # Ordenar por referidos de mayor a menor
+            sorted_users = sorted(profiles.items(), key=lambda x: x[1].get('referrals', 0), reverse=True)[:10]
+            texto = "🏆 **TOP 10 REFERIDORES** 🏆\n\n"
+            for i, (uid, prof) in enumerate(sorted_users):
+                if prof.get('referrals', 0) > 0:
+                    texto += f"{i+1}. @{prof.get('username','N/A')} - **{prof.get('referrals')} invitados**\n"
+            if texto == "🏆 **TOP 10 REFERIDORES** 🏆\n\n": texto += "_Nadie ha invitado a nadie aún._"
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=texto, reply_markup=admin_panel_keyboard(db), parse_mode="Markdown")
 
-    elif call.data == "admin_clear_dead_cookies":
-        initial = len(db['cookies_list'])
-        db['cookies_list'] = [c for c in db['cookies_list'] if c['status'] == 'active']
-        deleted = initial - len(db['cookies_list'])
-        save_db(db)
-        bot.answer_callback_query(call.id, f"🧹 Limpieza: {deleted} cuentas agotadas eliminadas.", show_alert=True)
+        elif call.data == "admin_broadcast":
+            msg = bot.send_message(call.message.chat.id, "📢 Envía el mensaje que le llegará a TODOS los usuarios:")
+            bot.register_next_step_handler(msg, process_broadcast)
+            
+        elif call.data == "admin_backup":
+            if os.path.exists('database.json'):
+                with open('database.json', 'rb') as doc:
+                    bot.send_document(call.message.chat.id, doc, caption="💾 Backup BD Actual")
+                    
+        elif call.data == "admin_export_users":
+            with open('users_export.txt', 'w', encoding='utf-8') as f:
+                f.write("ID | Username | Nombre | Plan | Ref | Fecha Ingreso\n")
+                f.write("-" * 75 + "\n")
+                for uid, p in db['user_profiles'].items():
+                    f.write(f"{uid} | @{p.get('username','N/A')} | {p.get('first_name','N/A')} | {p.get('plan')} | {p.get('referrals')} | {p.get('first_seen')}\n")
+            with open('users_export.txt', 'rb') as doc:
+                bot.send_document(call.message.chat.id, doc, caption="📄 Lista Completa de Usuarios")
+            os.remove('users_export.txt')
+                    
+        elif call.data == "admin_bans":
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔨 Banear ID", callback_data="ban_user"), InlineKeyboardButton("🕊️ Desbanear ID", callback_data="unban_user"))
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="🛡️ **Panel de Bloqueos**", reply_markup=markup, parse_mode="Markdown")
 
-    elif call.data == "admin_clear_cache":
-        clean_old_screenshots()
-        user_last_action.clear()
-        bot.answer_callback_query(call.id, "⚙️ Temporizadores y Caché limpiados con éxito.", show_alert=True)
-        
-    elif call.data == "admin_toggle_maint":
-        db['maintenance_mode'] = not db.get('maintenance_mode', False)
-        save_db(db)
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=admin_panel_keyboard(db))
+        elif call.data == "admin_clear_dead_cookies":
+            initial = len(db['cookies_list'])
+            db['cookies_list'] = [c for c in db['cookies_list'] if c['status'] == 'active']
+            deleted = initial - len(db['cookies_list'])
+            save_db(db)
+            bot.answer_callback_query(call.id, f"🧹 Limpieza: {deleted} cuentas agotadas eliminadas.", show_alert=True)
+
+        elif call.data == "admin_clear_cache":
+            auto_repair_system()
+            bot.answer_callback_query(call.id, "⚙️ Servidor purgado y RAM liberada con éxito.", show_alert=True)
+            
+        elif call.data == "admin_toggle_maint":
+            db['maintenance_mode'] = not db.get('maintenance_mode', False)
+            save_db(db)
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=admin_panel_keyboard(db))
+    except Exception as e:
+        bot.answer_callback_query(call.id, "❌ Error en el panel.")
+        print(e)
 
 def _edit_plan_limit(message, plan_type):
     try:
@@ -694,10 +769,10 @@ def process_manage_user(message):
     uid = message.text.strip()
     db = init_db()
     if uid in db['user_profiles']:
-        msg = bot.reply_to(message, f"👤 Usuario encontrado (@{db['user_profiles'][uid].get('username')}).\n\nOpciones:\nEscribe `VIP 30` para darle 30 días VIP.\nEscribe `FREE` para quitarle el VIP.")
+        msg = bot.reply_to(message, f"👤 Usuario @{db['user_profiles'][uid].get('username')}.\n\nEscribe `VIP 30` para darle 30 días VIP.\nEscribe `FREE` para quitarle el VIP.")
         bot.register_next_step_handler(msg, lambda m: process_manage_user_action(m, uid))
     else:
-        bot.reply_to(message, "❌ ID no encontrada en la base de datos.")
+        bot.reply_to(message, "❌ ID no encontrada.")
 
 def process_manage_user_action(message, uid):
     text = message.text.strip().upper().split()
@@ -718,7 +793,7 @@ def process_manage_user_action(message, uid):
             bot.reply_to(message, f"✅ Usuario {uid} degradado a plan Gratis.")
         save_db(db)
     except:
-        bot.reply_to(message, "❌ Formato incorrecto. Ejemplo: VIP 30")
+        bot.reply_to(message, "❌ Formato incorrecto.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("spy_") or call.data.startswith("del_admin_") or call.data in ["add_new_admin", "ban_user", "unban_user", "noop"])
 def manage_actions(call):
@@ -734,7 +809,7 @@ def manage_actions(call):
         target = int(call.data.replace("del_admin_", ""))
         if target in db['admins']:
             db['admins'].remove(target); save_db(db)
-            bot.answer_callback_query(call.id, "Admin eliminado.")
+            bot.answer_callback_query(call.id, "Admin eliminado.", show_alert=True)
     elif call.data == "add_new_admin":
         msg = bot.send_message(call.message.chat.id, "Envía la ID del nuevo admin:")
         bot.register_next_step_handler(msg, lambda m: _add_admin(m))
@@ -779,7 +854,7 @@ def process_add_cookie_data(message, country):
         db = init_db()
         db['cookies_list'].append({'country': country, 'data': json.dumps(cookies) if isinstance(cookies, list) else cookies, 'uses': 0, 'status': 'active'})
         save_db(db); bot.reply_to(message, "✅ Cookie guardada con éxito en la bóveda.")
-    else: bot.reply_to(message, "❌ Error de formato. Asegúrate de copiar todo el bloque.")
+    else: bot.reply_to(message, "❌ Error de formato.")
 
 def process_bulk_country(m):
     c = m.text.strip().capitalize()
@@ -793,20 +868,20 @@ def process_bulk_data(m, c):
         for arr in data:
             db['cookies_list'].append({'country': c, 'data': json.dumps(arr), 'uses': 0, 'status': 'active'})
             added += 1
-        save_db(db); bot.reply_to(m, f"✅ Lote importado: {added} cuentas nuevas añadidas.")
-    except: bot.reply_to(m, "❌ Error importando. Asegúrate de que es un JSON válido de arrays.")
+        save_db(db); bot.reply_to(m, f"✅ Lote importado: {added} cuentas nuevas.")
+    except: bot.reply_to(m, "❌ Error importando. Asegúrate de que es un JSON válido.")
 
 def process_broadcast(message):
     db = init_db()
     count = 0
-    bot.reply_to(message, "⏳ Enviando masivo. Esto puede tardar unos segundos...")
+    bot.reply_to(message, "⏳ Enviando masivo...")
     for uid in db.get('user_profiles', {}).keys():
         try: 
             bot.send_message(int(uid), f"🔔 **MENSAJE DEL ADMINISTRADOR** 🔔\n\n{message.text}", parse_mode="Markdown")
             time.sleep(0.05)
             count += 1
         except: pass
-    bot.send_message(message.chat.id, f"✅ Mensaje Masivo completado. Recibido por {count} usuarios.")
+    bot.send_message(message.chat.id, f"✅ Mensaje completado. Recibido por {count} usuarios.")
 
 @app.route('/')
 def home(): return "🚀 Servidor KANT FLIX Operativo y Despierto"
@@ -816,9 +891,10 @@ def run_web_server():
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    print("Iniciando base de datos...")
     init_db()
-    print("Iniciando servidor web Keep-Alive...")
     threading.Thread(target=run_web_server, daemon=True).start()
-    print("Iniciando Bot de Telegram...")
-    bot.infinity_polling()
+    while True:
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            time.sleep(5)
