@@ -145,11 +145,21 @@ def run_playwright_activation(code, cookie_data):
                     page.screenshot(path=screenshot_path)
                     return False, "❌ La cookie ha caducado o es inválida. Pide al admin que la cambie.", screenshot_path
                 
-                input_locator = page.locator('input[type="text"], input[data-uia="pin-number-input"]').first
-                input_locator.fill(code)
+                # --- NUEVA LÓGICA ANTI 8 CASILLAS ---
+                # Hacemos clic en el primer input visible (la primera de las 8 casillas)
+                page.locator('input').first.click(timeout=15000)
                 
+                # Usamos el teclado virtual de Playwright para teclear como humanos.
+                # Al escribir con delay, Netflix pasará solo a la siguiente casilla.
+                page.keyboard.type(code, delay=100)
+                
+                # Esperamos un poco a que el botón gris se vuelva clicable
+                time.sleep(2)
+                
+                # Buscamos y hacemos clic en el botón de continuar
                 button_locator = page.locator('button[type="button"], button[type="submit"], button[data-uia="action-submit"]').first
-                button_locator.click()
+                button_locator.click(timeout=10000)
+                # -------------------------------------
                 
                 time.sleep(5)
                 
