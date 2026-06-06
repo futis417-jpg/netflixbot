@@ -7,9 +7,9 @@ import config
 from config import bot, SUPER_ADMIN_ID, ADMIN_LINK, db_lock
 
 # ========================================================
-# CONFIGURACIÓN DE TU NUEVA BASE DE DATOS EN GITHUB (100% GRATIS)
-GITHUB_TOKEN = "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"
-GITHUB_REPO = "futis417-jpg/mi-bot-db" # Ej: "ishak/mi-bot-db"
+# CONFIGURACIÓN DE TU NUEVA BASE DE DATOS EN GITHUB
+GITHUB_TOKEN = "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"  # <-- Asegúrate de poner tu token aquí
+GITHUB_REPO = "futis417-jpg/mi-bot-db"
 GITHUB_FILE = "database.json"
 # ========================================================
 
@@ -20,10 +20,10 @@ HEADERS = {
 }
 
 def init_db():
-    """Lee la base de datos directamente desde GitHub de forma automática."""
+    """Lee la base de datos desde GitHub y asegura que los IDs sean strings."""
     with db_lock:
         default_db = {
-            'cookies_list': [], 'admins': [SUPER_ADMIN_ID], 'maintenance_mode': False,
+            'cookies_list': [], 'admins': [str(SUPER_ADMIN_ID)], 'maintenance_mode': False,
             'banned_users': [], 'user_profiles': {}, 'coupons': {},
             'stats': {'total_activations': 0, 'failed_attempts': 0, 'total_revenue_estim': 0},
             'plans': {
@@ -36,17 +36,22 @@ def init_db():
             response = requests.get(URL_API, headers=HEADERS)
             if response.status_code == 200:
                 datos_recurso = response.json()
-                # Decodificar el contenido que viene en Base64 desde GitHub
                 contenido_b64 = datos_recurso['content']
                 contenido_json = base64.b64decode(contenido_b64).decode('utf-8')
                 db = json.loads(contenido_json)
                 
-                # Asegurar que todas las llaves por defecto existan
+                # Forzar que todo lo que necesite el bot esté bien estructurado
                 for key in default_db:
                     if key not in db: db[key] = default_db[key]
-                if SUPER_ADMIN_ID not in db['admins']: db['admins'].append(SUPER_ADMIN_ID)
                 
-                for uid, profile in db['user_profiles'].items():
+                # Convertir la lista de admins a strings para evitar conflictos de tipo
+                db['admins'] = [str(a) for a in db.get('admins', [])]
+                if str(SUPER_ADMIN_ID) not in db['admins']: 
+                    db['admins'].append(str(SUPER_ADMIN_ID))
+                
+                # Asegurar que cada perfil tenga todos sus datos limpios
+                for uid, profile in list(db['user_profiles'].items()):
+                    if not profile: continue
                     if 'plan' not in profile: profile['plan'] = 'free'
                     if 'vip_expiry' not in profile: profile['vip_expiry'] = None
                     if 'daily_activations' not in profile: profile['daily_activations'] = 0
@@ -55,22 +60,22 @@ def init_db():
                     if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
                 return db
             else:
+                print(f"Error API GitHub: Status {response.status_code}. Usando DB por defecto.")
                 return default_db
         except Exception as e:
             print(f"Error cargando DB desde GitHub: {e}")
             return default_db
 
 def save_db(db_data):
-    """Guarda y sube los cambios a GitHub automáticamente haciendo un commit silencioso."""
+    """Guarda los cambios en GitHub de forma síncrona."""
     with db_lock:
         try:
-            # Primero necesitamos obtener el 'sha' del archivo actual para poder actualizarlo
+            # Obtener el SHA actual para poder hacer el commit correctamente
             response = requests.get(URL_API, headers=HEADERS)
             sha = ""
             if response.status_code == 200:
                 sha = response.json()['sha']
             
-            # Convertir el diccionario de datos a JSON ordenado
             contenido_json = json.dumps(db_data, indent=4)
             contenido_b64 = base64.b64encode(contenido_json.encode('utf-8')).decode('utf-8')
             
@@ -80,28 +85,31 @@ def save_db(db_data):
                 "sha": sha
             }
             
-            # Hacer el PUT para guardar los datos en la nube
-            requests.put(URL_API, headers=HEADERS, json=payload)
+            res_put = requests.put(URL_API, headers=HEADERS, json=payload)
+            if res_put.status_code not in [200, 201]:
+                print(f"Error al guardar en GitHub API: {res_put.status_code} - {res_put.text}")
         except Exception as e:
             print(f"Error guardando DB en GitHub: {e}")
 
 def is_admin(user_id):
-    if user_id == SUPER_ADMIN_ID: return True
     db = init_db()
-    return user_id in db.get('admins', [])
+    return str(user_id) in db.get('admins', [])
 
 def check_and_reset_daily_limits(uid_str, db):
-    today = datetime.now().strftime("%Y-%m-%d")
+    uid_str = str(uid_str)
     profile = db['user_profiles'].get(uid_str)
     
     if profile:
+        today = datetime.now().strftime("%Y-%m-%d")
         if profile.get('last_reset_date') != today:
             profile['daily_activations'] = 0
             profile['last_reset_date'] = today
             save_db(db)
     
-    from utils import auto_repair_system
-    auto_repair_system()
+    try:
+        from utils import auto_repair_system
+        auto_repair_system()
+    except: pass
     return profile
 
 def check_vip_status(user_id):
@@ -109,17 +117,20 @@ def check_vip_status(user_id):
     uid_str = str(user_id)
     profile = db['user_profiles'].get(uid_str, {})
     
-    if profile.get('plan') == 'vip' and profile.get('vip_expiry'):
-        expiry_date = datetime.strptime(profile['vip_expiry'], "%Y-%m-%d %H:%M:%S")
-        if datetime.now() > expiry_date:
-            db['user_profiles'][uid_str]['plan'] = 'free'
-            db['user_profiles'][uid_str]['vip_expiry'] = None
-            save_db(db)
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔄 Renovar VIP Ahora", url=ADMIN_LINK))
-            bot.send_message(user_id, "⚠️ **Tu suscripción VIP ha caducado.** Has vuelto al plan Gratuito.\n\nPulsa abajo para renovar con el Administrador.", reply_markup=markup, parse_mode="Markdown")
+    if profile and profile.get('plan') == 'vip' and profile.get('vip_expiry'):
+        try:
+            expiry_date = datetime.strptime(profile['vip_expiry'], "%Y-%m-%d %H:%M:%S")
+            if datetime.now() > expiry_date:
+                db['user_profiles'][uid_str]['plan'] = 'free'
+                db['user_profiles'][uid_str]['vip_expiry'] = None
+                save_db(db)
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔄 Renovar VIP Ahora", url=ADMIN_LINK))
+                bot.send_message(user_id, "⚠️ **Tu suscripción VIP ha caducado.** Has vuelto al plan Gratuito.\n\nPulsa abajo para renovar con el Administrador.", reply_markup=markup, parse_mode="Markdown")
+                return False
+            return True
+        except:
             return False
-        return True
     return False
 
 def track_user(message, referred_by=None):
@@ -143,22 +154,26 @@ def track_user(message, referred_by=None):
             'bonus_daily': bonus
         }
         
-        if referred_by and referred_by in db['user_profiles'] and referred_by != user_id:
-            db['user_profiles'][referred_by]['referrals'] += 1
-            refs = db['user_profiles'][referred_by]['referrals']
+        if referred_by and str(referred_by) in db['user_profiles'] and str(referred_by) != user_id:
+            ref_str = str(referred_by)
+            db['user_profiles'][ref_str]['referrals'] += 1
+            refs = db['user_profiles'][ref_str]['referrals']
             
             if refs % 2 == 0:
-                current_expiry = db['user_profiles'][referred_by].get('vip_expiry')
+                current_expiry = db['user_profiles'][ref_str].get('vip_expiry')
                 now = datetime.now()
                 
-                if db['user_profiles'][referred_by]['plan'] == 'vip' and current_expiry:
-                    new_expiry = datetime.strptime(current_expiry, "%Y-%m-%d %H:%M:%S") + timedelta(days=1)
+                if db['user_profiles'][ref_str]['plan'] == 'vip' and current_expiry:
+                    try:
+                        new_expiry = datetime.strptime(current_expiry, "%Y-%m-%d %H:%M:%S") + timedelta(days=1)
+                    except:
+                        new_expiry = now + timedelta(days=1)
                 else:
                     new_expiry = now + timedelta(days=1)
                     
-                db['user_profiles'][referred_by]['plan'] = 'vip'
-                db['user_profiles'][referred_by]['vip_expiry'] = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
-                db['user_profiles'][referred_by]['daily_activations'] = 0
+                db['user_profiles'][ref_str]['plan'] = 'vip'
+                db['user_profiles'][ref_str]['vip_expiry'] = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
+                db['user_profiles'][ref_str]['daily_activations'] = 0
                 
                 try:
                     bot.send_message(int(referred_by), f"🎉 **¡ENHORABUENA!** 🎉\n\nHas invitado a tu referido número {refs}. ¡Acabas de ganar **1 DÍA VIP GRATIS** de forma automática! 💎", parse_mode="Markdown")
