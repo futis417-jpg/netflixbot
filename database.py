@@ -1,11 +1,26 @@
 import json
-import os
+import requests
+import base64
 from datetime import datetime, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import config
 from config import bot, SUPER_ADMIN_ID, ADMIN_LINK, db_lock
 
+# ========================================================
+# CONFIGURACIÓN DE TU NUEVA BASE DE DATOS EN GITHUB (100% GRATIS)
+GITHUB_TOKEN = "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"
+GITHUB_REPO = "futis417-jpg/mi-bot-db" # Ej: "ishak/mi-bot-db"
+GITHUB_FILE = "database.json"
+# ========================================================
+
+URL_API = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
 def init_db():
+    """Lee la base de datos directamente desde GitHub de forma automática."""
     with db_lock:
         default_db = {
             'cookies_list': [], 'admins': [SUPER_ADMIN_ID], 'maintenance_mode': False,
@@ -17,12 +32,16 @@ def init_db():
             }
         }
         
-        if not os.path.exists('database.json'):
-            return default_db
-            
         try:
-            with open('database.json', 'r') as f:
-                db = json.load(f)
+            response = requests.get(URL_API, headers=HEADERS)
+            if response.status_code == 200:
+                datos_recurso = response.json()
+                # Decodificar el contenido que viene en Base64 desde GitHub
+                contenido_b64 = datos_recurso['content']
+                contenido_json = base64.b64decode(contenido_b64).decode('utf-8')
+                db = json.loads(contenido_json)
+                
+                # Asegurar que todas las llaves por defecto existan
                 for key in default_db:
                     if key not in db: db[key] = default_db[key]
                 if SUPER_ADMIN_ID not in db['admins']: db['admins'].append(SUPER_ADMIN_ID)
@@ -35,13 +54,36 @@ def init_db():
                     if 'referrals' not in profile: profile['referrals'] = 0
                     if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
                 return db
-        except:
+            else:
+                return default_db
+        except Exception as e:
+            print(f"Error cargando DB desde GitHub: {e}")
             return default_db
 
 def save_db(db_data):
+    """Guarda y sube los cambios a GitHub automáticamente haciendo un commit silencioso."""
     with db_lock:
-        with open('database.json', 'w') as f:
-            json.dump(db_data, f, indent=4)
+        try:
+            # Primero necesitamos obtener el 'sha' del archivo actual para poder actualizarlo
+            response = requests.get(URL_API, headers=HEADERS)
+            sha = ""
+            if response.status_code == 200:
+                sha = response.json()['sha']
+            
+            # Convertir el diccionario de datos a JSON ordenado
+            contenido_json = json.dumps(db_data, indent=4)
+            contenido_b64 = base64.b64encode(contenido_json.encode('utf-8')).decode('utf-8')
+            
+            payload = {
+                "message": "Update database via Kant Flix Bot",
+                "content": contenido_b64,
+                "sha": sha
+            }
+            
+            # Hacer el PUT para guardar los datos en la nube
+            requests.put(URL_API, headers=HEADERS, json=payload)
+        except Exception as e:
+            print(f"Error guardando DB en GitHub: {e}")
 
 def is_admin(user_id):
     if user_id == SUPER_ADMIN_ID: return True
@@ -58,7 +100,6 @@ def check_and_reset_daily_limits(uid_str, db):
             profile['last_reset_date'] = today
             save_db(db)
     
-    # Importación local para evitar importaciones circulares en tiempo de inicialización
     from utils import auto_repair_system
     auto_repair_system()
     return profile
