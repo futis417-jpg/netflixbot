@@ -1,3 +1,4 @@
+import os
 import json
 import requests
 import base64
@@ -7,8 +8,9 @@ import config
 from config import bot, SUPER_ADMIN_ID, ADMIN_LINK, db_lock
 
 # ========================================================
-# CONFIGURACIÓN DE TU NUEVA BASE DE DATOS EN GITHUB
-GITHUB_TOKEN = "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"  # <-- Asegúrate de poner tu token aquí
+# CONFIGURACIÓN AUTOMÁTICA DESDE RENDER / GITHUB
+# El token se lee automáticamente de la variable de entorno
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = "futis417-jpg/mi-bot-db"
 GITHUB_FILE = "database.json"
 # ========================================================
@@ -40,16 +42,13 @@ def init_db():
                 contenido_json = base64.b64decode(contenido_b64).decode('utf-8')
                 db = json.loads(contenido_json)
                 
-                # Forzar que todo lo que necesite el bot esté bien estructurado
                 for key in default_db:
                     if key not in db: db[key] = default_db[key]
                 
-                # Convertir la lista de admins a strings para evitar conflictos de tipo
                 db['admins'] = [str(a) for a in db.get('admins', [])]
                 if str(SUPER_ADMIN_ID) not in db['admins']: 
                     db['admins'].append(str(SUPER_ADMIN_ID))
                 
-                # Asegurar que cada perfil tenga todos sus datos limpios
                 for uid, profile in list(db['user_profiles'].items()):
                     if not profile: continue
                     if 'plan' not in profile: profile['plan'] = 'free'
@@ -60,7 +59,6 @@ def init_db():
                     if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
                 return db
             else:
-                print(f"Error API GitHub: Status {response.status_code}. Usando DB por defecto.")
                 return default_db
         except Exception as e:
             print(f"Error cargando DB desde GitHub: {e}")
@@ -70,7 +68,6 @@ def save_db(db_data):
     """Guarda los cambios en GitHub de forma síncrona."""
     with db_lock:
         try:
-            # Obtener el SHA actual para poder hacer el commit correctamente
             response = requests.get(URL_API, headers=HEADERS)
             sha = ""
             if response.status_code == 200:
@@ -85,9 +82,7 @@ def save_db(db_data):
                 "sha": sha
             }
             
-            res_put = requests.put(URL_API, headers=HEADERS, json=payload)
-            if res_put.status_code not in [200, 201]:
-                print(f"Error al guardar en GitHub API: {res_put.status_code} - {res_put.text}")
+            requests.put(URL_API, headers=HEADERS, json=payload)
         except Exception as e:
             print(f"Error guardando DB en GitHub: {e}")
 
@@ -99,7 +94,22 @@ def check_and_reset_daily_limits(uid_str, db):
     uid_str = str(uid_str)
     profile = db['user_profiles'].get(uid_str)
     
-    if profile:
+    if not profile:
+        profile = {
+            'first_seen': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'username': "Unknown",
+            'first_name': "User",
+            'activations': 0,
+            'plan': 'free',
+            'daily_activations': 0,
+            'last_reset_date': datetime.now().strftime("%Y-%m-%d"),
+            'vip_expiry': None,
+            'referrals': 0,
+            'bonus_daily': 0
+        }
+        db['user_profiles'][uid_str] = profile
+        save_db(db)
+    else:
         today = datetime.now().strftime("%Y-%m-%d")
         if profile.get('last_reset_date') != today:
             profile['daily_activations'] = 0
@@ -110,6 +120,7 @@ def check_and_reset_daily_limits(uid_str, db):
         from utils import auto_repair_system
         auto_repair_system()
     except: pass
+    
     return profile
 
 def check_vip_status(user_id):
