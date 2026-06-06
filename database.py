@@ -10,7 +10,7 @@ from config import bot, SUPER_ADMIN_ID, ADMIN_LINK, db_lock
 # ========================================================
 # CONFIGURACIÓN AUTOMÁTICA DESDE RENDER / GITHUB
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = "futis417-jpg/mi-bot-db"
+GITHUB_REPO = "futis417-jpg/mi-db-bot"  # Asegúrate de que el nombre del repo coincide
 GITHUB_FILE = "database.json"
 # ========================================================
 
@@ -21,7 +21,7 @@ HEADERS = {
 }
 
 def init_db():
-    """Lee la base de datos desde GitHub y duplica los IDs (int y str) para compatibilidad total."""
+    """Lee la base de datos de GitHub y genera perfiles de emergencia para evitar KeyErrors."""
     with db_lock:
         default_db = {
             'cookies_list': [], 'admins': [str(SUPER_ADMIN_ID), int(SUPER_ADMIN_ID)], 'maintenance_mode': False,
@@ -40,45 +40,61 @@ def init_db():
                 contenido_b64 = datos_recurso['content']
                 contenido_json = base64.b64decode(contenido_b64).decode('utf-8')
                 db = json.loads(contenido_json)
-                
-                for key in default_db:
-                    if key not in db: db[key] = default_db[key]
-                
-                # Asegurar compatibilidad de admins (tanto texto como número)
-                db['admins'] = list(set([str(a) for a in db.get('admins', [])] + [int(a) for a in db.get('admins', []) if str(a).isdigit()]))
-                
-                # PARCHE DE COMPATIBILIDAD TOTAL: Duplicar perfiles en str e int
-                profiles_limpios = {}
-                for uid, profile in list(db['user_profiles'].items()):
-                    if not profile: continue
-                    if 'plan' not in profile: profile['plan'] = 'free'
-                    if 'vip_expiry' not in profile: profile['vip_expiry'] = None
-                    if 'daily_activations' not in profile: profile['daily_activations'] = 0
-                    if 'last_reset_date' not in profile: profile['last_reset_date'] = datetime.now().strftime("%Y-%m-%d")
-                    if 'referrals' not in profile: profile['referrals'] = 0
-                    if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
-                    
-                    # Guardar el perfil indexado de las dos formas posibles
-                    profiles_limpios[str(uid)] = profile
-                    if str(uid).isdigit():
-                        profiles_limpios[int(uid)] = profile
-                
-                db['user_profiles'] = profiles_limpios
-                return db
             else:
-                return default_db
+                db = default_db
         except Exception as e:
             print(f"Error cargando DB desde GitHub: {e}")
-            return default_db
+            db = default_db
+
+        # Asegurar que existan todas las estructuras base
+        for key in default_db:
+            if key not in db: db[key] = default_db[key]
+        
+        db['admins'] = list(set([str(a) for a in db.get('admins', [])] + [int(a) for a in db.get('admins', []) if str(a).isdigit()]))
+
+        # Limpiar y parsear perfiles existentes
+        profiles_limpios = {}
+        for uid, profile in list(db.get('user_profiles', {}).items()):
+            if not profile: continue
+            if 'plan' not in profile: profile['plan'] = 'free'
+            if 'vip_expiry' not in profile: profile['vip_expiry'] = None
+            if 'daily_activations' not in profile: profile['daily_activations'] = 0
+            if 'last_reset_date' not in profile: profile['last_reset_date'] = datetime.now().strftime("%Y-%m-%d")
+            if 'referrals' not in profile: profile['referrals'] = 0
+            if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
+            
+            profiles_limpios[str(uid)] = profile
+            profiles_limpios[int(uid)] = profile
+        
+        # 🚨 PARCHE DEFINITIVO: Si tu ID de Super Admin no está en el JSON, crearlo de emergencia
+        # Esto evita que 'user_handlers.py' rompa al intentar leer tu menú de referidos.
+        for admin_id in [str(SUPER_ADMIN_ID), int(SUPER_ADMIN_ID)]:
+            if admin_id not in profiles_limpios:
+                perfil_admin = {
+                    'first_seen': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'username': "Admin",
+                    'first_name': "Creador",
+                    'activations': 0,
+                    'plan': 'vip',  # Te ponemos VIP directamente por ser el dueño
+                    'daily_activations': 0,
+                    'last_reset_date': datetime.now().strftime("%Y-%m-%d"),
+                    'vip_expiry': "2036-01-01 00:00:00",
+                    'referrals': 0,
+                    'bonus_daily': 0
+                }
+                profiles_limpios[str(SUPER_ADMIN_ID)] = perfil_admin
+                profiles_limpios[int(SUPER_ADMIN_ID)] = perfil_admin
+        
+        db['user_profiles'] = profiles_limpios
+        return db
 
 def save_db(db_data):
-    """Limpia los IDs duplicados antes de subir el archivo a GitHub para mantenerlo limpio."""
+    """Limpia los IDs duplicados e hilos antes de subir el archivo a GitHub."""
     with db_lock:
         try:
-            # Clonar los datos para no alterar la ejecución del bot en memoria
             db_to_save = dict(db_data)
             
-            # Al guardar en el archivo JSON externo, solo dejamos las llaves en formato string (así es el estándar JSON)
+            # Limpiar perfiles para que en GitHub solo queden guardados como String (formato estándar JSON)
             if 'user_profiles' in db_to_save:
                 profiles_clean = {}
                 for uid, profile in db_to_save['user_profiles'].items():
@@ -111,7 +127,8 @@ def is_admin(user_id):
     return str(user_id) in [str(a) for a in db.get('admins', [])]
 
 def check_and_reset_daily_limits(uid_str, db):
-    profile = db['user_profiles'].get(uid_str) or db['user_profiles'].get(str(uid_str)) or db['user_profiles'].get(int(uid_str) if str(uid_str).isdigit() else None)
+    uid_key = str(uid_str)
+    profile = db['user_profiles'].get(uid_key)
     
     if not profile:
         profile = {
