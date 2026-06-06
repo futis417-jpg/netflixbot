@@ -9,7 +9,6 @@ from config import bot, SUPER_ADMIN_ID, ADMIN_LINK, db_lock
 
 # ========================================================
 # CONFIGURACIÓN AUTOMÁTICA DESDE RENDER / GITHUB
-# El token se lee automáticamente de la variable de entorno
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = "futis417-jpg/mi-bot-db"
 GITHUB_FILE = "database.json"
@@ -22,10 +21,10 @@ HEADERS = {
 }
 
 def init_db():
-    """Lee la base de datos desde GitHub y asegura que los IDs sean strings."""
+    """Lee la base de datos desde GitHub y duplica los IDs (int y str) para compatibilidad total."""
     with db_lock:
         default_db = {
-            'cookies_list': [], 'admins': [str(SUPER_ADMIN_ID)], 'maintenance_mode': False,
+            'cookies_list': [], 'admins': [str(SUPER_ADMIN_ID), int(SUPER_ADMIN_ID)], 'maintenance_mode': False,
             'banned_users': [], 'user_profiles': {}, 'coupons': {},
             'stats': {'total_activations': 0, 'failed_attempts': 0, 'total_revenue_estim': 0},
             'plans': {
@@ -45,10 +44,11 @@ def init_db():
                 for key in default_db:
                     if key not in db: db[key] = default_db[key]
                 
-                db['admins'] = [str(a) for a in db.get('admins', [])]
-                if str(SUPER_ADMIN_ID) not in db['admins']: 
-                    db['admins'].append(str(SUPER_ADMIN_ID))
+                # Asegurar compatibilidad de admins (tanto texto como número)
+                db['admins'] = list(set([str(a) for a in db.get('admins', [])] + [int(a) for a in db.get('admins', []) if str(a).isdigit()]))
                 
+                # PARCHE DE COMPATIBILIDAD TOTAL: Duplicar perfiles en str e int
+                profiles_limpios = {}
                 for uid, profile in list(db['user_profiles'].items()):
                     if not profile: continue
                     if 'plan' not in profile: profile['plan'] = 'free'
@@ -57,6 +57,13 @@ def init_db():
                     if 'last_reset_date' not in profile: profile['last_reset_date'] = datetime.now().strftime("%Y-%m-%d")
                     if 'referrals' not in profile: profile['referrals'] = 0
                     if 'bonus_daily' not in profile: profile['bonus_daily'] = 0
+                    
+                    # Guardar el perfil indexado de las dos formas posibles
+                    profiles_limpios[str(uid)] = profile
+                    if str(uid).isdigit():
+                        profiles_limpios[int(uid)] = profile
+                
+                db['user_profiles'] = profiles_limpios
                 return db
             else:
                 return default_db
@@ -65,15 +72,28 @@ def init_db():
             return default_db
 
 def save_db(db_data):
-    """Guarda los cambios en GitHub de forma síncrona."""
+    """Limpia los IDs duplicados antes de subir el archivo a GitHub para mantenerlo limpio."""
     with db_lock:
         try:
+            # Clonar los datos para no alterar la ejecución del bot en memoria
+            db_to_save = dict(db_data)
+            
+            # Al guardar en el archivo JSON externo, solo dejamos las llaves en formato string (así es el estándar JSON)
+            if 'user_profiles' in db_to_save:
+                profiles_clean = {}
+                for uid, profile in db_to_save['user_profiles'].items():
+                    profiles_clean[str(uid)] = profile
+                db_to_save['user_profiles'] = profiles_clean
+                
+            if 'admins' in db_to_save:
+                db_to_save['admins'] = list(set([str(a) for a in db_to_save['admins']]))
+            
             response = requests.get(URL_API, headers=HEADERS)
             sha = ""
             if response.status_code == 200:
                 sha = response.json()['sha']
             
-            contenido_json = json.dumps(db_data, indent=4)
+            contenido_json = json.dumps(db_to_save, indent=4)
             contenido_b64 = base64.b64encode(contenido_json.encode('utf-8')).decode('utf-8')
             
             payload = {
@@ -88,11 +108,10 @@ def save_db(db_data):
 
 def is_admin(user_id):
     db = init_db()
-    return str(user_id) in db.get('admins', [])
+    return str(user_id) in [str(a) for a in db.get('admins', [])]
 
 def check_and_reset_daily_limits(uid_str, db):
-    uid_str = str(uid_str)
-    profile = db['user_profiles'].get(uid_str)
+    profile = db['user_profiles'].get(uid_str) or db['user_profiles'].get(str(uid_str)) or db['user_profiles'].get(int(uid_str) if str(uid_str).isdigit() else None)
     
     if not profile:
         profile = {
@@ -107,7 +126,8 @@ def check_and_reset_daily_limits(uid_str, db):
             'referrals': 0,
             'bonus_daily': 0
         }
-        db['user_profiles'][uid_str] = profile
+        db['user_profiles'][str(uid_str)] = profile
+        db['user_profiles'][int(uid_str)] = profile
         save_db(db)
     else:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -125,19 +145,18 @@ def check_and_reset_daily_limits(uid_str, db):
 
 def check_vip_status(user_id):
     db = init_db()
-    uid_str = str(user_id)
-    profile = db['user_profiles'].get(uid_str, {})
+    profile = db['user_profiles'].get(str(user_id)) or db['user_profiles'].get(int(user_id))
     
     if profile and profile.get('plan') == 'vip' and profile.get('vip_expiry'):
         try:
             expiry_date = datetime.strptime(profile['vip_expiry'], "%Y-%m-%d %H:%M:%S")
             if datetime.now() > expiry_date:
-                db['user_profiles'][uid_str]['plan'] = 'free'
-                db['user_profiles'][uid_str]['vip_expiry'] = None
+                profile['plan'] = 'free'
+                profile['vip_expiry'] = None
                 save_db(db)
                 markup = InlineKeyboardMarkup()
                 markup.add(InlineKeyboardButton("🔄 Renovar VIP Ahora", url=ADMIN_LINK))
-                bot.send_message(user_id, "⚠️ **Tu suscripción VIP ha caducado.** Has vuelto al plan Gratuito.\n\nPulsa abajo para renovar con el Administrador.", reply_markup=markup, parse_mode="Markdown")
+                bot.send_message(int(user_id), "⚠️ **Tu suscripción VIP ha caducado.** Has vuelto al plan Gratuito.\n\nPulsa abajo para renovar con el Administrador.", reply_markup=markup, parse_mode="Markdown")
                 return False
             return True
         except:
@@ -146,13 +165,13 @@ def check_vip_status(user_id):
 
 def track_user(message, referred_by=None):
     db = init_db()
-    user_id = str(message.from_user.id)
+    user_id = message.from_user.id
     is_new = False
     
-    if user_id not in db['user_profiles']:
+    if str(user_id) not in db['user_profiles'] and int(user_id) not in db['user_profiles']:
         is_new = True
         bonus = 1 if referred_by else 0 
-        db['user_profiles'][user_id] = {
+        nuevo_perfil = {
             'first_seen': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'username': message.from_user.username,
             'first_name': message.from_user.first_name,
@@ -164,39 +183,43 @@ def track_user(message, referred_by=None):
             'referrals': 0,
             'bonus_daily': bonus
         }
+        db['user_profiles'][str(user_id)] = nuevo_perfil
+        db['user_profiles'][int(user_id)] = nuevo_perfil
         
-        if referred_by and str(referred_by) in db['user_profiles'] and str(referred_by) != user_id:
-            ref_str = str(referred_by)
-            db['user_profiles'][ref_str]['referrals'] += 1
-            refs = db['user_profiles'][ref_str]['referrals']
-            
-            if refs % 2 == 0:
-                current_expiry = db['user_profiles'][ref_str].get('vip_expiry')
-                now = datetime.now()
-                
-                if db['user_profiles'][ref_str]['plan'] == 'vip' and current_expiry:
-                    try:
-                        new_expiry = datetime.strptime(current_expiry, "%Y-%m-%d %H:%M:%S") + timedelta(days=1)
-                    except:
-                        new_expiry = now + timedelta(days=1)
-                else:
-                    new_expiry = now + timedelta(days=1)
+        if referred_by:
+            for r_key in [str(referred_by), int(referred_by)]:
+                if r_key in db['user_profiles']:
+                    db['user_profiles'][r_key]['referrals'] += 1
+                    refs = db['user_profiles'][r_key]['referrals']
                     
-                db['user_profiles'][ref_str]['plan'] = 'vip'
-                db['user_profiles'][ref_str]['vip_expiry'] = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
-                db['user_profiles'][ref_str]['daily_activations'] = 0
-                
-                try:
-                    bot.send_message(int(referred_by), f"🎉 **¡ENHORABUENA!** 🎉\n\nHas invitado a tu referido número {refs}. ¡Acabas de ganar **1 DÍA VIP GRATIS** de forma automática! 💎", parse_mode="Markdown")
-                except: pass
-            else:
-                try:
-                    bot.send_message(int(referred_by), f"👤 **¡Nuevo invitado unido!** (Llevas {refs}).\n¡Solo te falta 1 más para ganar 1 Día VIP! 💎", parse_mode="Markdown")
-                except: pass
-                
+                    if refs % 2 == 0:
+                        current_expiry = db['user_profiles'][r_key].get('vip_expiry')
+                        now = datetime.now()
+                        if db['user_profiles'][r_key]['plan'] == 'vip' and current_expiry:
+                            try:
+                                new_expiry = datetime.strptime(current_expiry, "%Y-%m-%d %H:%M:%S") + timedelta(days=1)
+                            except:
+                                new_expiry = now + timedelta(days=1)
+                        else:
+                            new_expiry = now + timedelta(days=1)
+                            
+                        db['user_profiles'][r_key]['plan'] = 'vip'
+                        db['user_profiles'][r_key]['vip_expiry'] = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
+                        db['user_profiles'][r_key]['daily_activations'] = 0
+                        
+                        try:
+                            bot.send_message(int(referred_by), f"🎉 **¡ENHORABUENA!** 🎉\n\nHas invitado a tu referido número {refs}. ¡Acabas de ganar **1 DÍA VIP GRATIS** de forma automática! 💎", parse_mode="Markdown")
+                        except: pass
+                    else:
+                        try:
+                            bot.send_message(int(referred_by), f"👤 **¡Nuevo invitado unido!** (Llevas {refs}).\n¡Solo te falta 1 más para ganar 1 Día VIP! 💎", parse_mode="Markdown")
+                        except: pass
+                    break
         save_db(db)
     else:
-        db['user_profiles'][user_id]['username'] = message.from_user.username
-        db['user_profiles'][user_id]['first_name'] = message.from_user.first_name
+        for u_key in [str(user_id), int(user_id)]:
+            if u_key in db['user_profiles']:
+                db['user_profiles'][u_key]['username'] = message.from_user.username
+                db['user_profiles'][u_key]['first_name'] = message.from_user.first_name
         save_db(db)
     return is_new
