@@ -185,6 +185,11 @@ def admin_callbacks(call):
             if os.path.exists('database.json'):
                 with open('database.json', 'rb') as doc:
                     bot.send_document(call.message.chat.id, doc, caption="💾 Backup BD Actual")
+
+        # NUEVO BOTÓN AÑADIDO: RESTAURAR BD
+        elif call.data == "admin_restore":
+            msg = bot.send_message(call.message.chat.id, "📤 **RESTAURAR BASE DE DATOS**\n\nEnvíame el archivo `database.json` directamente por aquí para restaurar todo. (¡Asegúrate de enviar el archivo correcto!)", parse_mode="Markdown")
+            bot.register_next_step_handler(msg, process_restore_db)
                     
         elif call.data == "admin_export_users":
             # Exporta los datos de usuario a un archivo incluyendo activaciones
@@ -356,14 +361,54 @@ def process_bulk_data(m, c):
         save_db(db); bot.reply_to(m, f"✅ Lote importado: {added} cuentas nuevas.")
     except: bot.reply_to(m, "❌ Error importando. Asegúrate de que es un JSON válido.")
 
+# FUNCIÓN MEJORADA: MENSAJE MASIVO (BROADCAST) A PRUEBA DE FALLOS
 def process_broadcast(message):
+    if not message.text:
+        bot.reply_to(message, "❌ El mensaje debe ser de texto.")
+        return
+
     db = init_db()
     count = 0
-    bot.reply_to(message, "⏳ Enviando masivo...")
+    bot.reply_to(message, "⏳ Enviando masivo... Esto puede tardar un poco dependiendo del número de usuarios.")
     for uid in db.get('user_profiles', {}).keys():
         try: 
+            # Intento principal: envía con Markdown
             bot.send_message(int(uid), f"🔔 **MENSAJE DEL ADMINISTRADOR** 🔔\n\n{message.text}", parse_mode="Markdown")
             time.sleep(0.05)
             count += 1
-        except: pass
-    bot.send_message(message.chat.id, f"✅ Mensaje completado. Recibido por {count} usuarios.")
+        except Exception: 
+            try:
+                # Sistema a prueba de fallos: si falla el Markdown, envía en texto plano
+                bot.send_message(int(uid), f"🔔 MENSAJE DEL ADMINISTRADOR 🔔\n\n{message.text}")
+                time.sleep(0.05)
+                count += 1
+            except: pass
+    bot.send_message(message.chat.id, f"✅ Mensaje completado. Recibido exitosamente por {count} usuarios.")
+
+# NUEVA FUNCIÓN: RESTAURAR BASE DE DATOS
+def process_restore_db(message):
+    if not message.document:
+        bot.reply_to(message, "❌ Debes enviar un archivo adjunto. Operación cancelada.")
+        return
+
+    if not message.document.file_name.endswith('.json'):
+        bot.reply_to(message, "❌ El archivo debe ser `.json`. Operación cancelada.")
+        return
+
+    try:
+        bot.reply_to(message, "⏳ Procesando e instalando la base de datos...")
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        # Validamos que el archivo JSON se pueda leer correctamente
+        new_db = json.loads(downloaded_file.decode('utf-8'))
+
+        # Medida de seguridad: verificamos que tenga los datos mínimos del bot
+        if 'user_profiles' not in new_db or 'cookies_list' not in new_db:
+            bot.reply_to(message, "❌ El archivo JSON no tiene la estructura válida para este bot.")
+            return
+
+        save_db(new_db) # Guarda y aplica TODO de verdad
+        bot.reply_to(message, "✅ **¡BASE DE DATOS RESTAURADA CON ÉXITO!**\n\nTodos los usuarios, referidos, planes VIP, cookies y configuraciones se han recuperado y aplicado al sistema al instante.", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error al restaurar la base de datos: {str(e)}")
