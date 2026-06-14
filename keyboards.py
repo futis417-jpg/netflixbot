@@ -38,20 +38,19 @@ def admin_panel_keyboard(db):
     markup.add(InlineKeyboardButton("📸 Modo Espía", callback_data="admin_spy_menu"), InlineKeyboardButton("🔍 Diagnóstico Pro", callback_data="admin_check"))
     markup.add(InlineKeyboardButton("👥 Admins", callback_data="admin_manage_admins"), InlineKeyboardButton("🏆 Top Referidos", callback_data="admin_top_refs"))
     markup.add(InlineKeyboardButton("📢 Mensaje Masivo", callback_data="admin_broadcast"), InlineKeyboardButton("🛡️ Panel Baneos", callback_data="admin_bans"))
+    
     markup.add(InlineKeyboardButton("📄 Exportar BD", callback_data="admin_backup"), InlineKeyboardButton("📤 Restaurar BD", callback_data="admin_restore"))
+    
     markup.add(InlineKeyboardButton("📄 Exportar Usuarios", callback_data="admin_export_users"), InlineKeyboardButton("🧹 Limpiar Agotadas", callback_data="admin_clear_dead_cookies"))
     markup.add(InlineKeyboardButton("⚙️ Forzar Limpieza", callback_data="admin_clear_cache"))
+    
     maint_text = "🔴 Quitar Mantenimiento" if db.get('maintenance_mode', False) else "🟢 Poner Mantenimiento"
     markup.add(InlineKeyboardButton(maint_text, callback_data="admin_toggle_maint"))
     return markup
 
 def admin_plans_keyboard(db):
-
-def admin_plans_keyboard(db):
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton(f"✏️ Editar Límite Gratis ({db['plans']['free']['daily_limit']}/día)", callback_data="admin_edit_plan_free"),
-        InlineKeyboardButton(f"✏️ Editar Límite VIP ({db['plans']['vip']['daily_limit']}/día)", callback_data="admin_edit_plan_vip"),
-        InlineKeyboardButton("🔙 Volver al Panel", callback_data="admin_back_panel")
-    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✏️ Editar Límite Gratis", callback_data="admin_edit_plan_free"))
+    markup.add(InlineKeyboardButton("✏️ Editar Límite VIP", callback_data="admin_edit_plan_vip"))
+    markup.add(InlineKeyboardButton("🔙 Volver", callback_data="admin_back_panel"))
     return markup
